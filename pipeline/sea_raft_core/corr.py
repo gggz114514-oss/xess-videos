@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -111,10 +113,62 @@ class CorrBlock:
         batch, dim, h1, w1 = fmap1.shape
         h2, w2 = fmap2.shape[2:]
         fmap1 = fmap1.view(batch, num_head, dim // num_head, h1*w1)
-        fmap2 = fmap2.view(batch, num_head, dim // num_head, h2*w2) 
+        fmap2 = fmap2.view(batch, num_head, dim // num_head, h2*w2)
         corr = fmap1.transpose(2, 3) @ fmap2
         corr = corr.reshape(batch, num_head, h1, w1, h2, w2).permute(0, 2, 3, 1, 4, 5)
         return corr  / torch.sqrt(torch.tensor(dim).float())
+
+
+class StreamingCorrBlock:
+    """Memory-bounded drop-in replacement for CorrBlock at high resolutions.
+
+    CorrBlock stores one all-pairs correlation row per pixel,
+    [batch*h1*w1, h2*w2] per pyramid level, so its size grows with the square
+    of resolution (~25 GiB for a single 1440p bidirectional frame pair).
+    This block never materialises that volume: for each tap it bilinear-samples
+    fmap2 at the current coordinates plus the tap offset and takes the
+    channel-wise inner product with fmap1.  The inner product is linear in
+    fmap2 and bilinear sampling is affine with weights summing to one, so the
+    result matches the dense block in exact arithmetic while transient memory
+    stays O(h*w) per tap.  Pure PyTorch ops only, so it runs on XPU without a
+    compiled kernel; the per-tap loop trades extra bandwidth for that memory
+    bound and is only selected above the dense budget in raft.py.
+    """
+
+    def __init__(self, fmap1, fmap2, args):
+        self.num_levels = args.corr_levels
+        self.radius = args.corr_radius
+        self.args = args
+        self.fmap1 = fmap1
+        self.scale = math.sqrt(fmap1.shape[1])
+        self.fmap2_levels = [fmap2]
+        for _ in range(self.num_levels - 1):
+            fmap2 = F.interpolate(fmap2, scale_factor=0.5, mode='bilinear', align_corners=False)
+            self.fmap2_levels.append(fmap2)
+
+    def __call__(self, coords, dilation=None):
+        r = self.radius
+        coords = coords.permute(0, 2, 3, 1)                     # [B, H, W, 2]
+        batch, h1, w1, _ = coords.shape
+        device = coords.device
+        if dilation is None:
+            dilation = torch.ones(batch, 1, h1, w1, device=device)
+        dilation = dilation.permute(0, 2, 3, 1)                 # [B, H, W, 1]
+        dx = torch.linspace(-r, r, 2*r+1, device=device)
+        dy = torch.linspace(-r, r, 2*r+1, device=device)
+        delta = torch.stack(torch.meshgrid(dy, dx), axis=-1).view(-1, 1, 2)
+        out_pyramid = []
+        for i in range(self.num_levels):
+            centroid_lvl = coords / 2 ** i                      # [B, H, W, 2]
+            taps = []
+            for tap in delta:
+                grid_lvl = centroid_lvl + tap * dilation        # [B, H, W, 2]
+                sampled = bilinear_sampler(self.fmap2_levels[i], grid_lvl)
+                taps.append((self.fmap1 * sampled).sum(dim=1))  # [B, H, W]
+            level = torch.stack(taps, dim=-1) / self.scale      # [B, H, W, T]
+            out_pyramid.append(level)
+        out = torch.cat(out_pyramid, dim=-1)
+        return out.permute(0, 3, 1, 2).contiguous().float()
 
 # class CorrBlock:
 #     def __init__(self, context, fmap1, fmap2, args):
